@@ -1,5 +1,6 @@
-import os
+from datetime import datetime, timedelta
 from pathlib import Path
+import os
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -13,44 +14,52 @@ DB_NAME = os.environ["DB_NAME"]
 DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 
-OUT_DIR = Path("datasets/orders_cooking_v1")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-DATE_FROM = "2024 -01-01"  # для проверки поставь пораньше; потом вернёшь нужный период
-
 engine = create_engine(
     f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
     pool_pre_ping=True,
     pool_recycle=3600,
-    echo=True,  # включи, если хочешь видеть SQL в логах
+    echo=True,  # выключите, когда всё заработает
 )
 
+OUT_DIR = Path("datasets/orders_cooking_vB_packed")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
 QUERY = """
-WITH kitchen AS (
-    SELECT
-        order_id,
-        MIN(updated_at) AS kitchen_time
-    FROM orders_orderaudit
-    WHERE status = 'kitchen'
-    GROUP BY order_id
+WITH orders_in_range AS (
+    SELECT id, point_id, city_id, delivery_method, delivery_at_client, created_at, persons
+    FROM orders_order
+    WHERE created_at >= :start_dt
+      AND created_at <  :end_dt
 ),
-packed AS (
+kitchen_a AS (
     SELECT
         a.order_id,
-        MIN(a.updated_at) AS packed_time
+        a.updated_at AS kitchen_time,
+        a.dump_item  AS kitchen_dump_item,
+        ROW_NUMBER() OVER (PARTITION BY a.order_id ORDER BY a.updated_at ASC, a.id ASC) AS rn
+    FROM orders_orderaudit a
+    JOIN orders_in_range o ON o.id = a.order_id
+    WHERE a.status = 'kitchen'
+),
+kitchen AS (
+    SELECT order_id, kitchen_time, kitchen_dump_item
+    FROM kitchen_a
+    WHERE rn = 1
+),
+packed_a AS (
+    SELECT
+        a.order_id,
+        a.updated_at AS packed_time,
+        ROW_NUMBER() OVER (PARTITION BY a.order_id ORDER BY a.updated_at ASC, a.id ASC) AS rn
     FROM orders_orderaudit a
     JOIN kitchen k ON k.order_id = a.order_id
     WHERE a.status = 'packed'
       AND a.updated_at > k.kitchen_time
-    GROUP BY a.order_id
 ),
-items AS (
-    SELECT
-        order_id,
-        COALESCE(SUM(quantity), 0) AS items_qty_total,
-        COUNT(*) AS items_lines
-    FROM orders_item
-    GROUP BY order_id
+packed AS (
+    SELECT order_id, packed_time
+    FROM packed_a
+    WHERE rn = 1
 )
 SELECT
     o.id AS order_id,
@@ -60,68 +69,46 @@ SELECT
     o.delivery_at_client,
     o.created_at,
     o.persons,
-    i.items_qty_total,
-    i.items_lines,
     k.kitchen_time,
     p.packed_time,
-    TIMESTAMPDIFF(MINUTE, k.kitchen_time, p.packed_time) AS cooking_minutes
-FROM orders_order o
+    TIMESTAMPDIFF(MINUTE, k.kitchen_time, p.packed_time) AS cooking_minutes,
+    k.kitchen_dump_item AS dump_item
+FROM orders_in_range o
 JOIN kitchen k ON k.order_id = o.id
 JOIN packed  p ON p.order_id = o.id
-LEFT JOIN items i ON i.order_id = o.id
-WHERE o.created_at >= :date_from
-  AND p.packed_time > k.kitchen_time
+WHERE p.packed_time > k.kitchen_time;
 """
 
+START = datetime(2025, 6, 1)
+END   = datetime(2026, 1, 9)
+
+def daterange(start, end, step_days=7):
+    cur = start
+    while cur < end:
+        nxt = min(cur + timedelta(days=step_days), end)
+        yield cur, nxt
+        cur = nxt
+
 def main():
-    chunksize = 200_000
-    part = 0
-
     with engine.connect() as conn:
-        # Быстрые sanity checks (по желанию)
-        db = pd.read_sql(text("SELECT DATABASE() AS db"), conn)
-        print(db.to_string(index=False))
+        for start_dt, end_dt in daterange(START, END, step_days=7):
+            df = pd.read_sql_query(
+                text(QUERY),
+                conn,
+                params={"start_dt": start_dt, "end_dt": end_dt},
+            )
 
-        iter_df = pd.read_sql_query(
-            sql=text(QUERY),
-            con=conn,
-            params={"date_from": DATE_FROM},
-            chunksize=chunksize,
-        )
-
-        for chunk in iter_df:
-            print(f"raw chunk rows: {len(chunk):,}")
-            if chunk.empty:
-                print("chunk is empty -> skip")
+            if df.empty:
+                print(f"{start_dt}..{end_dt}: empty")
                 continue
 
-            # Преобразуем даты
-            chunk["kitchen_time"] = pd.to_datetime(chunk["kitchen_time"], errors="coerce")
-            chunk["packed_time"] = pd.to_datetime(chunk["packed_time"], errors="coerce")
-            chunk["created_at"] = pd.to_datetime(chunk["created_at"], errors="coerce")
+            # минимальная чистка (настройте порог позже)
+            df = df.dropna(subset=["cooking_minutes", "dump_item", "kitchen_time", "packed_time"])
+            df = df[(df["cooking_minutes"] > 0) & (df["cooking_minutes"] < 600)]
 
-            # Базовая чистка
-            chunk = chunk.dropna(subset=["kitchen_time", "packed_time", "cooking_minutes"])
-
-            # Фильтры по здравому смыслу (временно можно ослабить для дебага)
-            chunk = chunk[chunk["cooking_minutes"] > 0]
-            chunk = chunk[chunk["cooking_minutes"] < 240]  # 4 часа; подстрой под бизнес
-
-            if chunk.empty:
-                print("all rows filtered out -> skip")
-                continue
-
-            # Фичи времени (по кухне)
-            chunk["weekday"] = chunk["kitchen_time"].dt.weekday
-            chunk["hour"] = chunk["kitchen_time"].dt.hour
-
-            out_path = OUT_DIR / f"part-{part:05d}.parquet"
-            chunk.to_parquet(out_path, index=False)
-            print(f"Saved {len(chunk):,} rows -> {out_path}")
-
-            part += 1
-
-    print("Done.")
+            out_path = OUT_DIR / f"start={start_dt.date()}_end={end_dt.date()}.parquet"
+            df.to_parquet(out_path, index=False)
+            print(f"{start_dt}..{end_dt}: saved {len(df):,} -> {out_path}")
 
 if __name__ == "__main__":
     main()
