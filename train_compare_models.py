@@ -69,8 +69,7 @@ def split_by_point_order_id(
     Гарантирует, что каждая точка (point_id) отдаёт ~train_frac заказов в train (по времени),
     сортируя внутри точки по order_id (proxy времени).
 
-    Если у точки мало заказов (< min_per_point), то все заказы точки отправляются в train
-    (иначе val/test будут статистически невалидными и "шумными").
+    Если у точки мало заказов (< min_per_point), то все заказы точки отправляются в train.
     """
     if "point_id" not in df.columns:
         raise ValueError("point_id is required for per-point split")
@@ -79,7 +78,7 @@ def split_by_point_order_id(
     val_idx: List[np.ndarray] = []
     test_idx: List[np.ndarray] = []
 
-    for pid, g in df.groupby("point_id", sort=False):
+    for _, g in df.groupby("point_id", sort=False):
         g_sorted = g.sort_values("order_id")
         idx = g_sorted.index.to_numpy()
         n = len(idx)
@@ -91,14 +90,11 @@ def split_by_point_order_id(
         n_train = int(n * train_frac)
         n_val = int(n * val_frac)
 
-        # защита от пустых частей
         n_train = max(n_train, 1)
         n_val = max(n_val, 1)
 
-        # test — остаток
         n_test = n - n_train - n_val
         if n_test < 1:
-            # если не хватает на test — уменьшаем val
             n_val = max(0, n - n_train - 1)
             n_test = n - n_train - n_val
 
@@ -250,7 +246,6 @@ def load_all_parts(
 
         if items_path is not None:
             X = load_npz(items_path).tocsr()
-            # подстрахуемся, если вдруг файл/df слегка не совпали по длине
             if X.shape[0] != len(df):
                 X = X[: len(df)]
             mats.append(X)
@@ -269,27 +264,57 @@ def load_all_parts(
     return df_all, X_items
 
 
+def _filter_df_and_items(
+    df: pd.DataFrame,
+    X_items: Optional[sparse.csr_matrix],
+    mask: pd.Series,
+) -> Tuple[pd.DataFrame, Optional[sparse.csr_matrix]]:
+    idx = np.flatnonzero(mask.to_numpy())
+    df2 = df.iloc[idx].reset_index(drop=True)
+    if X_items is None:
+        return df2, None
+    return df2, X_items[idx]
+
+
 # -----------------------------
 # Feature preprocessing
 # -----------------------------
 
-def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
+def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Предзаказы удалены.
-    Табличные признаки:
-      - категориальные: point_id, city_id, delivery_method, point_hour(=point_id×hour)
-      - числовые: weekday, hour, is_weekend, items_* агрегаты + нелинейности
+    Добавляем:
+      - point_hour: категориальная фича = "{point_id}__{hour}"
+      - qty_log1p = log1p(items_qty_total_all)
+      - qty_sq = items_qty_total_all^2
+      - qty_x_unique = items_qty_total_all * items_unique_all
     """
-    cat_cols = [c for c in ["point_id", "city_id", "delivery_method", "point_hour"] if c in df.columns]
+    if "point_id" in df.columns and "hour" in df.columns:
+        pid = pd.to_numeric(df["point_id"], errors="coerce").fillna(-1).astype("int32")
+        hr = pd.to_numeric(df["hour"], errors="coerce").fillna(-1).astype("int16")
+        df["point_hour"] = pid.astype(str) + "__" + hr.astype(str)
 
+    if "items_qty_total_all" in df.columns:
+        q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
+        df["items_qty_total_all_log1p"] = np.log1p(q).astype("float32")
+        df["items_qty_total_all_sq"] = (q * q).astype("float32")
+
+    if "items_qty_total_all" in df.columns and "items_unique_all" in df.columns:
+        q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
+        u = pd.to_numeric(df["items_unique_all"], errors="coerce").fillna(0.0).astype("float32")
+        df["items_qty_x_unique"] = (q * u).astype("float32")
+
+    return df
+
+
+def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
+    cat_cols = [c for c in ["point_id", "city_id", "delivery_method", "point_hour"] if c in df.columns]
     num_cols = [c for c in [
         "weekday", "hour", "is_weekend",
         "items_qty_total_all", "items_lines_all", "items_unique_all",
         "items_qty_total_all_log1p", "items_qty_total_all_sq", "items_qty_x_unique",
     ] if c in df.columns]
 
-    # IMPORTANT: чтобы не взрывать OHE на редких point_hour, можно включить min_frequency
-    # (если sklearn >= 1.2). Если нет — оставь как было.
+    # если sklearn>=1.2: min_frequency помогает не взрывать редкие point_hour
     try:
         cat_tf = OneHotEncoder(handle_unknown="ignore", min_frequency=50)
     except TypeError:
@@ -307,8 +332,12 @@ def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
     )
 
 
-
-def make_X(preprocessor: ColumnTransformer, df: pd.DataFrame, X_items: Optional[sparse.csr_matrix], fit: bool) -> sparse.csr_matrix:
+def make_X(
+    preprocessor: ColumnTransformer,
+    df: pd.DataFrame,
+    X_items: Optional[sparse.csr_matrix],
+    fit: bool,
+) -> sparse.csr_matrix:
     X_tab = preprocessor.fit_transform(df) if fit else preprocessor.transform(df)
     if X_items is None:
         return X_tab.tocsr()
@@ -374,39 +403,53 @@ class PointHourMeanBaseline:
         return out
 
 
-def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+# -----------------------------
+# Blend helper
+# -----------------------------
+
+def _metric_value(m: Metrics, metric: str) -> float:
+    if metric == "p90":
+        return m.p90_abs_err
+    if metric == "mae":
+        return m.mae
+    if metric == "rmse":
+        return m.rmse
+    raise ValueError(f"Unknown blend metric: {metric}")
+
+
+def best_blend_weight(
+    y_val: np.ndarray,
+    pred_model: np.ndarray,
+    pred_base: np.ndarray,
+    metric: str = "p90",
+    grid: Optional[np.ndarray] = None,
+) -> Tuple[float, Metrics]:
     """
-    Добавляем:
-      - point_hour: категориальная фича = "{point_id}__{hour}"
-      - qty_log1p = log1p(items_qty_total_all)
-      - qty_sq = items_qty_total_all^2
-      - qty_x_unique = items_qty_total_all * items_unique_all
+    Finds w in [0..1] to minimize metric on y_val for:
+        pred = w*pred_model + (1-w)*pred_base
     """
-    # point_hour (категория)
-    if "point_id" in df.columns and "hour" in df.columns:
-        pid = pd.to_numeric(df["point_id"], errors="coerce").fillna(-1).astype("int32")
-        hr = pd.to_numeric(df["hour"], errors="coerce").fillna(-1).astype("int16")
-        df["point_hour"] = pid.astype(str) + "__" + hr.astype(str)
+    if grid is None:
+        grid = np.linspace(0.0, 1.0, 21)
 
-    # qty нелинейности
-    if "items_qty_total_all" in df.columns:
-        q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
-        df["items_qty_total_all_log1p"] = np.log1p(q).astype("float32")
-        df["items_qty_total_all_sq"] = (q * q).astype("float32")
+    best_w = 1.0
+    best_m = compute_metrics(y_val, pred_model)
+    best_score = _metric_value(best_m, metric)
 
-    # взаимодействие qty * unique
-    if "items_qty_total_all" in df.columns and "items_unique_all" in df.columns:
-        q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
-        u = pd.to_numeric(df["items_unique_all"], errors="coerce").fillna(0.0).astype("float32")
-        df["items_qty_x_unique"] = (q * u).astype("float32")
+    for w in grid:
+        p = w * pred_model + (1.0 - w) * pred_base
+        m = compute_metrics(y_val, p)
+        score = _metric_value(m, metric)
 
-    return df
+        if (score < best_score) or (score == best_score and m.mae < best_m.mae):
+            best_w = float(w)
+            best_m = m
+            best_score = score
 
-
+    return best_w, best_m
 
 
 # -----------------------------
-# Training / evaluation
+# Main
 # -----------------------------
 
 def main() -> None:
@@ -415,9 +458,24 @@ def main() -> None:
     ap.add_argument("--items-dir", default=None, help="prepared_items_hash directory with items-part-*.npz")
     ap.add_argument("--out-dir", default="model_out", help="output directory for metrics/plots/models")
     ap.add_argument("--max-rows", type=int, default=None, help="optional cap for quick experiments")
+
     ap.add_argument("--use-log-target", action="store_true", help="train on log1p(y) and invert for metrics")
     ap.add_argument("--seed", type=int, default=42)
 
+    ap.add_argument("--min-per-point", type=int, default=50)
+    ap.add_argument("--train-frac", type=float, default=0.80)
+    ap.add_argument("--val-frac", type=float, default=0.10)
+
+    ap.add_argument("--drop-preorders", action="store_true", help="Drop delivery_at_client=1 if column exists")
+    ap.add_argument("--exclude-points", type=str, default=None, help="Comma-separated point_ids to drop, e.g. 624,777")
+
+    # cap predictions
+    ap.add_argument("--no-cap", action="store_true", help="Disable prediction capping")
+    ap.add_argument("--pred-cap", type=float, default=None, help="Hard cap on predictions in minutes (e.g. 240)")
+    ap.add_argument("--pred-cap-quantile", type=float, default=0.995,
+                    help="If pred-cap not set: cap = quantile(y_train, q). Set --no-cap to disable.")
+
+    # models
     ap.add_argument("--ridge-alpha", type=float, default=10.0)
 
     ap.add_argument("--sgd-alpha", type=float, default=1e-5)
@@ -425,16 +483,9 @@ def main() -> None:
     ap.add_argument("--sgd-epsilon", type=float, default=1.35)
     ap.add_argument("--sgd-max-iter", type=int, default=50)
 
-    # per-point split params
-    ap.add_argument("--min-per-point", type=int, default=50, help="if point has < N rows -> all go to train")
-    ap.add_argument("--train-frac", type=float, default=0.80)
-    ap.add_argument("--val-frac", type=float, default=0.10)
-
-    # safety (если вдруг предзаказы просочились)
-    ap.add_argument("--drop-preorders", action="store_true", help="Drop delivery_at_client=1 if column exists")
-
-    # optional prediction cap (minutes) to avoid absurd values
-    ap.add_argument("--pred-cap", type=float, default=None, help="Optional cap on predictions in minutes (e.g. 240)")
+    # blend
+    ap.add_argument("--no-blend", action="store_true", help="Disable blending with baseline_point_hour_mean")
+    ap.add_argument("--blend-metric", type=str, default="p90", choices=["p90", "mae", "rmse"])
 
     args = ap.parse_args()
 
@@ -446,38 +497,25 @@ def main() -> None:
     pairs = pair_parts(base_dir, items_dir)
     df, X_items = load_all_parts(pairs, max_rows=args.max_rows)
 
-    # optional: drop preorders (страховка)
     preorder_share = None
     if "delivery_at_client" in df.columns:
         df["delivery_at_client"] = pd.to_numeric(df["delivery_at_client"], errors="coerce").fillna(0).astype("int8")
         preorder_share = float((df["delivery_at_client"] == 1).mean())
         if args.drop_preorders:
-            df = df[df["delivery_at_client"] == 0].copy()
-            if X_items is not None:
-                # маска по индексу после фильтра
-                # df после фильтра сохранил исходные индексы, поэтому reset:
-                keep_idx = df.index.to_numpy()
-                df = df.reset_index(drop=True)
-                X_items = X_items[keep_idx]
+            mask = df["delivery_at_client"] == 0
+            df, X_items = _filter_df_and_items(df, X_items, mask)
 
+    excluded_points: List[int] = []
+    if args.exclude_points and "point_id" in df.columns:
+        excluded_points = [int(x) for x in args.exclude_points.split(",") if x.strip()]
+        if excluded_points:
+            mask = ~df["point_id"].isin(excluded_points)
+            df, X_items = _filter_df_and_items(df, X_items, mask)
 
-    # добавляем кросс-фичи и нелинейности
     df = add_derived_features(df)
 
-    # на всякий: прибиваем NaN в числовых фичах, чтобы Ridge/SGD не падали
-    for c in [
-        "weekday", "hour", "is_weekend",
-        "items_qty_total_all", "items_lines_all", "items_unique_all",
-        "items_qty_total_all_log1p", "items_qty_total_all_sq", "items_qty_x_unique",
-    ]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    y = pd.to_numeric(df["cooking_minutes"], errors="coerce").to_numpy().astype(float)
 
-
-    # target
-    y = df["cooking_minutes"].to_numpy().astype(float)
-
-    # per-point split
     train_idx, val_idx, test_idx = split_by_point_order_id(
         df,
         train_frac=args.train_frac,
@@ -492,50 +530,60 @@ def main() -> None:
     X_items_val = X_items[val_idx] if X_items is not None else None
     X_items_test = X_items[test_idx] if X_items is not None else None
 
-    # preprocess
     pre = build_preprocessor(df_train)
     X_train = make_X(pre, df_train, X_items_train, fit=True)
     X_val = make_X(pre, df_val, X_items_val, fit=False)
     X_test = make_X(pre, df_test, X_items_test, fit=False)
 
-    # target transform
     def y_to_train_space(y_arr: np.ndarray) -> np.ndarray:
         return np.log1p(y_arr) if args.use_log_target else y_arr
+
+    y_train_t = y_to_train_space(y_train)
+
+    # cap by train quantile / hard
+    cap_mode = "disabled"
+    cap_minutes: Optional[float] = None
+    if not args.no_cap:
+        if args.pred_cap is not None:
+            cap_mode = "hard"
+            cap_minutes = float(args.pred_cap)
+        else:
+            q = float(args.pred_cap_quantile)
+            if 0.0 < q < 1.0:
+                cap_mode = "quantile"
+                cap_minutes = float(np.quantile(y_train, q))
 
     def pred_to_minutes(p: np.ndarray) -> np.ndarray:
         if args.use_log_target:
             p = np.expm1(p)
         p = np.clip(p, 0.0, None)
-        if args.pred_cap is not None:
-            p = np.minimum(p, float(args.pred_cap))
+        if cap_minutes is not None:
+            p = np.minimum(p, cap_minutes)
         return p
 
-    y_train_t = y_to_train_space(y_train)
-
-    # ---------------- Models ----------------
+    # ---------------- Baselines ----------------
     results = []
     preds_test: Dict[str, np.ndarray] = {}
 
-    # Baseline 1: global median
-    m1 = GlobalMedianBaseline().fit(y_train)
-    pred = m1.predict(len(y_test))
+    m_median = GlobalMedianBaseline().fit(y_train)
+    pred = m_median.predict(len(y_test))
     preds_test["baseline_median"] = pred
     results.append(("baseline_median", compute_metrics(y_test, pred)))
 
-    # Baseline 2: point-hour mean
-    m2 = PointHourMeanBaseline().fit(df_train, y_train)
-    pred = m2.predict(df_test)
-    preds_test["baseline_point_hour_mean"] = pred
-    results.append(("baseline_point_hour_mean", compute_metrics(y_test, pred)))
+    baseline = PointHourMeanBaseline().fit(df_train, y_train)
+    pred_base_val = baseline.predict(df_val)
+    pred_base_test = baseline.predict(df_test)
+    preds_test["baseline_point_hour_mean"] = pred_base_test
+    results.append(("baseline_point_hour_mean", compute_metrics(y_test, pred_base_test)))
 
-    # Ridge
+    # ---------------- Models ----------------
     ridge = Ridge(alpha=args.ridge_alpha, solver="sag", random_state=args.seed)
     ridge.fit(X_train, y_train_t)
-    pred = pred_to_minutes(ridge.predict(X_test))
-    preds_test["ridge"] = pred
-    results.append(("ridge", compute_metrics(y_test, pred)))
+    pred_ridge_val = pred_to_minutes(ridge.predict(X_val))
+    pred_ridge_test = pred_to_minutes(ridge.predict(X_test))
+    preds_test["ridge"] = pred_ridge_test
+    results.append(("ridge", compute_metrics(y_test, pred_ridge_test)))
 
-    # SGDRegressor
     sgd = SGDRegressor(
         loss=args.sgd_loss,
         alpha=args.sgd_alpha,
@@ -549,11 +597,34 @@ def main() -> None:
         random_state=args.seed,
     )
     sgd.fit(X_train, y_train_t)
-    pred = pred_to_minutes(sgd.predict(X_test))
-    preds_test["sgd"] = pred
-    results.append(("sgd", compute_metrics(y_test, pred)))
+    pred_sgd_val = pred_to_minutes(sgd.predict(X_val))
+    pred_sgd_test = pred_to_minutes(sgd.predict(X_test))
+    preds_test["sgd"] = pred_sgd_test
+    results.append(("sgd", compute_metrics(y_test, pred_sgd_test)))
 
-    # ---------------- Metrics table ----------------
+    # ---------------- Blend with baseline ----------------
+    blend_info = {"enabled": False}
+    if not args.no_blend and len(val_idx) > 0:
+        blend_info["enabled"] = True
+        blend_info["metric"] = args.blend_metric
+        blend_info["grid"] = {"n": 21, "from": 0.0, "to": 1.0}
+
+        w_ridge, m_ridge_val = best_blend_weight(y_val, pred_ridge_val, pred_base_val, metric=args.blend_metric)
+        pred_ridge_blend = w_ridge * pred_ridge_test + (1.0 - w_ridge) * pred_base_test
+        preds_test["ridge_blend"] = pred_ridge_blend
+        results.append(("ridge_blend", compute_metrics(y_test, pred_ridge_blend)))
+
+        w_sgd, m_sgd_val = best_blend_weight(y_val, pred_sgd_val, pred_base_val, metric=args.blend_metric)
+        pred_sgd_blend = w_sgd * pred_sgd_test + (1.0 - w_sgd) * pred_base_test
+        preds_test["sgd_blend"] = pred_sgd_blend
+        results.append(("sgd_blend", compute_metrics(y_test, pred_sgd_blend)))
+
+        blend_info["weights"] = {
+            "ridge": {"w_model": w_ridge, "val_metrics": m_ridge_val.__dict__},
+            "sgd": {"w_model": w_sgd, "val_metrics": m_sgd_val.__dict__},
+        }
+
+    # ---------------- Save metrics ----------------
     rows = []
     for name, met in results:
         rows.append({
@@ -580,38 +651,53 @@ def main() -> None:
     joblib.dump(pre, out_dir / "preprocessor.joblib")
     joblib.dump(ridge, out_dir / "ridge.joblib")
     joblib.dump(sgd, out_dir / "sgd.joblib")
+    joblib.dump(baseline, out_dir / "baseline_point_hour_mean.joblib")
 
-    # Split stats per point (sanity)
-    points = df["point_id"].nunique() if "point_id" in df.columns else None
-    points_in_test = df_test["point_id"].nunique() if "point_id" in df_test.columns else None
+    points_total = int(df["point_id"].nunique()) if "point_id" in df.columns else None
+    points_in_test = int(df_test["point_id"].nunique()) if "point_id" in df_test.columns else None
 
     info = {
         "seed": int(args.seed),
         "use_log_target": bool(args.use_log_target),
-        "drop_preorders_flag": bool(args.drop_preorders),
-        "preorder_share_before_drop": preorder_share,
+        "preorders": {
+            "drop_preorders_flag": bool(args.drop_preorders),
+            "preorder_share_before_drop": preorder_share,
+        },
+        "excluded_points": excluded_points,
         "split": {
             "type": "per_point_order_id",
             "train_frac": args.train_frac,
             "val_frac": args.val_frac,
             "min_per_point": args.min_per_point,
             "rows": {"train": int(len(df_train)), "val": int(len(df_val)), "test": int(len(df_test))},
-            "points_total": points,
+            "points_total": points_total,
             "points_in_test": points_in_test,
         },
-        "ridge_alpha": args.ridge_alpha,
+        "pred_cap": {
+            "enabled": cap_minutes is not None,
+            "mode": cap_mode,
+            "minutes": cap_minutes,
+            "quantile": None if args.no_cap or args.pred_cap is not None else float(args.pred_cap_quantile),
+        },
+        "ridge": {"alpha": args.ridge_alpha},
         "sgd": {
             "alpha": args.sgd_alpha,
             "loss": args.sgd_loss,
             "epsilon": args.sgd_epsilon,
             "max_iter": args.sgd_max_iter,
         },
-        "pred_cap": args.pred_cap,
-        "notes": "Preorders assumed removed in prepare_dataset. Split is per-point by order_id (proxy time).",
+        "blend": blend_info,
         "files": {
             "metrics": str(metrics_path),
             "plots_dir": str(out_dir),
+            "models": {
+                "preprocessor": "preprocessor.joblib",
+                "ridge": "ridge.joblib",
+                "sgd": "sgd.joblib",
+                "baseline_point_hour_mean": "baseline_point_hour_mean.joblib",
+            },
         },
+        "notes": "X = [OHE(cats)+Scaled(nums)] + hashed_items_sparse (if provided). Split is per-point by order_id.",
     }
     (out_dir / "run_info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -620,6 +706,12 @@ def main() -> None:
     print(json.dumps(info["split"], ensure_ascii=False, indent=2))
     if preorder_share is not None:
         print(f"\nPreorders share in loaded data (before optional drop): {preorder_share:.4f}")
+    if cap_minutes is not None:
+        print(f"\nPrediction cap: mode={cap_mode}, minutes={cap_minutes:.2f}")
+    if blend_info.get("enabled"):
+        w_r = blend_info["weights"]["ridge"]["w_model"]
+        w_s = blend_info["weights"]["sgd"]["w_model"]
+        print(f"\nBlend enabled (metric={args.blend_metric}): ridge w={w_r:.2f}, sgd w={w_s:.2f}")
     print(f"\nSaved to: {out_dir}")
 
 

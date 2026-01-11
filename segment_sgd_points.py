@@ -42,7 +42,7 @@ def pair_parts(base_dir: Path, items_dir: Optional[Path]) -> List[Tuple[Path, Op
     if len(item_files) != len(base_files):
         raise ValueError(f"parts mismatch: parquet={len(base_files)} vs npz={len(item_files)}")
 
-    pairs: List[Tuple[Path, Optional[Path]]] = []
+    pairs = []
     for bf, itf in zip(base_files, item_files):
         if _part_num(bf) != _part_num(itf):
             raise ValueError(f"part id mismatch: {bf.name} vs {itf.name}")
@@ -86,34 +86,36 @@ def load_all_parts(
         X_items = sparse.vstack(mats).tocsr()
         if X_items.shape[0] != len(df_all):
             raise ValueError(f"Row mismatch: df={len(df_all)} vs X_items={X_items.shape[0]}")
-
     return df_all, X_items
+
+
+def _filter_df_and_items(
+    df: pd.DataFrame,
+    X_items: Optional[sparse.csr_matrix],
+    mask: pd.Series,
+) -> Tuple[pd.DataFrame, Optional[sparse.csr_matrix]]:
+    idx = np.flatnonzero(mask.to_numpy())
+    df2 = df.iloc[idx].reset_index(drop=True)
+    if X_items is None:
+        return df2, None
+    return df2, X_items[idx]
 
 
 # -----------------------------
 # Derived features (MUST match training)
 # -----------------------------
+
 def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Must match train_compare_models.py:
-      - point_hour: "{point_id}__{hour}"
-      - items_qty_total_all_log1p
-      - items_qty_total_all_sq
-      - items_qty_x_unique
-    """
-    # point_hour (category)
     if "point_id" in df.columns and "hour" in df.columns:
         pid = pd.to_numeric(df["point_id"], errors="coerce").fillna(-1).astype("int32")
         hr = pd.to_numeric(df["hour"], errors="coerce").fillna(-1).astype("int16")
         df["point_hour"] = pid.astype(str) + "__" + hr.astype(str)
 
-    # qty nonlinearities
     if "items_qty_total_all" in df.columns:
         q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
         df["items_qty_total_all_log1p"] = np.log1p(q).astype("float32")
         df["items_qty_total_all_sq"] = (q * q).astype("float32")
 
-    # interaction qty * unique
     if "items_qty_total_all" in df.columns and "items_unique_all" in df.columns:
         q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
         u = pd.to_numeric(df["items_unique_all"], errors="coerce").fillna(0.0).astype("float32")
@@ -123,8 +125,9 @@ def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# Split (MUST match training: per-point time-aware)
+# Split (MUST match training)
 # -----------------------------
+
 def split_by_point_order_id(
     df: pd.DataFrame,
     train_frac: float = 0.80,
@@ -138,7 +141,7 @@ def split_by_point_order_id(
     val_idx: List[np.ndarray] = []
     test_idx: List[np.ndarray] = []
 
-    for pid, g in df.groupby("point_id", sort=False):
+    for _, g in df.groupby("point_id", sort=False):
         g_sorted = g.sort_values("order_id")
         idx = g_sorted.index.to_numpy()
         n = len(idx)
@@ -166,13 +169,13 @@ def split_by_point_order_id(
     train = np.concatenate(train_idx) if train_idx else np.array([], dtype=int)
     val = np.concatenate(val_idx) if val_idx else np.array([], dtype=int)
     test = np.concatenate(test_idx) if test_idx else np.array([], dtype=int)
-
     return train, val, test
 
 
 # -----------------------------
-# Baseline (point-hour mean) for comparison
+# Baseline (point-hour mean) for comparison / blending
 # -----------------------------
+
 class PointHourMeanBaseline:
     def __init__(self):
         self.global_mean_: float = 0.0
@@ -215,7 +218,7 @@ class PointHourMeanBaseline:
 
 
 # -----------------------------
-# Metrics helper
+# Segment metrics
 # -----------------------------
 @dataclass
 class SegMetrics:
@@ -267,7 +270,6 @@ def segment_metrics(
 
     agg = agg[agg["count"] >= min_count].copy()
     agg = agg.sort_values(["p90_abs_err", "mae"], ascending=False)
-
     return agg
 
 
@@ -321,12 +323,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-dir", required=True)
     ap.add_argument("--items-dir", default=None)
-    ap.add_argument("--model-dir", required=True, help="directory with preprocessor.joblib + ridge.joblib + sgd.joblib")
+    ap.add_argument("--model-dir", required=True, help="directory with preprocessor.joblib + ridge.joblib + sgd.joblib (+ run_info.json)")
     ap.add_argument("--out-dir", default="diag_out")
-    ap.add_argument("--max-rows", type=int, default=None, help="cap rows for faster diagnostics")
-    ap.add_argument("--min-count", type=int, default=200, help="min group size for segment tables")
-    ap.add_argument("--use-log-target", action="store_true", help="if models trained on log1p(y)")
-    ap.add_argument("--drop-preorders", action="store_true", help="Drop delivery_at_client=1 if column exists")
+    ap.add_argument("--max-rows", type=int, default=None)
+    ap.add_argument("--min-count", type=int, default=200)
+
+    ap.add_argument("--use-log-target", action="store_true", help="force log1p inversion (if run_info not found)")
+
+    ap.add_argument("--min-per-point", type=int, default=50)
+    ap.add_argument("--train-frac", type=float, default=0.80)
+    ap.add_argument("--val-frac", type=float, default=0.10)
+
+    ap.add_argument("--drop-preorders", action="store_true")
+    ap.add_argument("--exclude-points", type=str, default=None)
+
     args = ap.parse_args()
 
     base_dir = Path(args.base_dir)
@@ -335,48 +345,54 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # load data
+    run_info = {}
+    run_info_path = model_dir / "run_info.json"
+    if run_info_path.exists():
+        run_info = json.loads(run_info_path.read_text(encoding="utf-8"))
+
+    use_log_target = bool(args.use_log_target) or bool(run_info.get("use_log_target", False))
+
+    cap_minutes = None
+    pred_cap_info = run_info.get("pred_cap") or {}
+    if pred_cap_info.get("enabled"):
+        cap_minutes = pred_cap_info.get("minutes")
+
+    blend_info = run_info.get("blend") or {}
+    w_ridge = None
+    w_sgd = None
+    if blend_info.get("enabled"):
+        weights = blend_info.get("weights") or {}
+        w_ridge = (weights.get("ridge") or {}).get("w_model")
+        w_sgd = (weights.get("sgd") or {}).get("w_model")
+
     pairs = pair_parts(base_dir, items_dir)
     df, X_items = load_all_parts(pairs, max_rows=args.max_rows)
 
-    # optional: drop preorders (should be 0, but keep as safety)
     if "delivery_at_client" in df.columns:
         df["delivery_at_client"] = pd.to_numeric(df["delivery_at_client"], errors="coerce").fillna(0).astype("int8")
         if args.drop_preorders:
-            keep_mask = (df["delivery_at_client"] == 0).to_numpy()
-            df = df.loc[keep_mask].copy().reset_index(drop=True)
-            if X_items is not None:
-                X_items = X_items[keep_mask]
+            mask = df["delivery_at_client"] == 0
+            df, X_items = _filter_df_and_items(df, X_items, mask)
 
-    # IMPORTANT: add derived features (MUST match training)
+    if args.exclude_points and "point_id" in df.columns:
+        excluded_points = [int(x) for x in args.exclude_points.split(",") if x.strip()]
+        if excluded_points:
+            mask = ~df["point_id"].isin(excluded_points)
+            df, X_items = _filter_df_and_items(df, X_items, mask)
+
     df = add_derived_features(df)
 
-    # load models + run_info for split params (if exists)
-    run_info_path = model_dir / "run_info.json"
-    split_params = {"train_frac": 0.80, "val_frac": 0.10, "min_per_point": 50}
-    if run_info_path.exists():
-        try:
-            info = json.loads(run_info_path.read_text(encoding="utf-8"))
-            sp = info.get("split", {})
-            split_params["train_frac"] = float(sp.get("train_frac", split_params["train_frac"]))
-            split_params["val_frac"] = float(sp.get("val_frac", split_params["val_frac"]))
-            split_params["min_per_point"] = int(sp.get("min_per_point", split_params["min_per_point"]))
-        except Exception:
-            pass
-
-    # split MUST match training: per-point order_id
-    train_idx, val_idx, test_idx = split_by_point_order_id(
+    train_idx, _, test_idx = split_by_point_order_id(
         df,
-        train_frac=split_params["train_frac"],
-        val_frac=split_params["val_frac"],
-        min_per_point=split_params["min_per_point"],
+        train_frac=args.train_frac,
+        val_frac=args.val_frac,
+        min_per_point=args.min_per_point,
     )
-
     df_train = df.iloc[train_idx].copy()
     df_test = df.iloc[test_idx].copy()
 
-    y_train = df_train["cooking_minutes"].to_numpy().astype(float)
-    y_test = df_test["cooking_minutes"].to_numpy().astype(float)
+    y_train = pd.to_numeric(df_train["cooking_minutes"], errors="coerce").to_numpy().astype(float)
+    y_test = pd.to_numeric(df_test["cooking_minutes"], errors="coerce").to_numpy().astype(float)
 
     X_items_train = X_items[train_idx] if X_items is not None else None
     X_items_test = X_items[test_idx] if X_items is not None else None
@@ -385,7 +401,12 @@ def main():
     ridge = joblib.load(model_dir / "ridge.joblib")
     sgd = joblib.load(model_dir / "sgd.joblib")
 
-    # build X (preprocessor expects derived columns to exist!)
+    baseline_path = model_dir / "baseline_point_hour_mean.joblib"
+    if baseline_path.exists():
+        baseline = joblib.load(baseline_path)
+    else:
+        baseline = PointHourMeanBaseline().fit(df_train, y_train)
+
     X_train_tab = pre.transform(df_train)
     X_test_tab = pre.transform(df_test)
 
@@ -393,23 +414,28 @@ def main():
     X_test = hstack([X_test_tab, X_items_test], format="csr") if X_items_test is not None else X_test_tab.tocsr()
 
     def pred_to_minutes(p: np.ndarray) -> np.ndarray:
-        if args.use_log_target:
+        if use_log_target:
             p = np.expm1(p)
-        return np.clip(p, 0.0, None)
+        p = np.clip(p, 0.0, None)
+        if cap_minutes is not None:
+            p = np.minimum(p, float(cap_minutes))
+        return p
 
     pred_ridge = pred_to_minutes(ridge.predict(X_test))
     pred_sgd = pred_to_minutes(sgd.predict(X_test))
-
-    baseline = PointHourMeanBaseline().fit(df_train, y_train)
     pred_ph = baseline.predict(df_test)
 
-    models = {
-        "ridge": pred_ridge,
+    models: Dict[str, np.ndarray] = {
         "sgd": pred_sgd,
+        "ridge": pred_ridge,
         "baseline_point_hour_mean": pred_ph,
     }
 
-    # overall summary
+    if w_ridge is not None:
+        models["ridge_blend"] = float(w_ridge) * pred_ridge + (1.0 - float(w_ridge)) * pred_ph
+    if w_sgd is not None:
+        models["sgd_blend"] = float(w_sgd) * pred_sgd + (1.0 - float(w_sgd)) * pred_ph
+
     overall_rows = []
     for name, yp in models.items():
         mae = float(mean_absolute_error(y_test, yp))
@@ -419,7 +445,6 @@ def main():
     overall = pd.DataFrame(overall_rows).sort_values("MAE")
     overall.to_csv(out_dir / "overall_summary.csv", index=False)
 
-    # worst orders dump
     for name, yp in models.items():
         abs_err = np.abs(y_test - yp)
         top_idx = np.argsort(-abs_err)[:200]
@@ -428,37 +453,33 @@ def main():
         worst["y_pred"] = yp[top_idx]
         worst["abs_err"] = abs_err[top_idx]
         worst["err"] = (worst["y_true"] - worst["y_pred"])
-
         keep = [c for c in worst.columns if c in [
-            "order_id","point_id","city_id","delivery_method",
-            "weekday","hour","is_weekend",
-            "items_qty_total_all","items_lines_all","items_unique_all",
-            "items_qty_total_all_log1p","items_qty_total_all_sq","items_qty_x_unique",
+            "order_id", "point_id", "city_id", "delivery_method", "delivery_at_client",
+            "persons", "weekday", "hour", "is_weekend",
+            "items_qty_total_all", "items_lines_all", "items_unique_all",
+            "items_qty_total_all_log1p", "items_qty_total_all_sq", "items_qty_x_unique",
             "point_hour",
-            "y_true","y_pred","abs_err","err",
+            "y_true", "y_pred", "abs_err", "err",
         ]]
         worst[keep].to_csv(out_dir / f"worst_orders__{name}.csv", index=False)
 
-    # segments
-    segment_defs = [
+    segment_defs: List[Tuple[List[str], str]] = [
         (["point_id"], "point"),
         (["hour"], "hour"),
         (["weekday"], "weekday"),
         (["delivery_method"], "delivery_method"),
-        (["point_id", "hour"], "point_hour_pair"),
         (["point_hour"], "point_hour_token"),
+        (["point_id", "hour"], "point_hour_pair"),
     ]
 
-    # size buckets on test
     for col in ["items_qty_total_all", "items_unique_all"]:
         if col in df_test.columns:
-            arr = pd.to_numeric(df_test[col], errors="coerce").fillna(0).to_numpy()
-            qs = np.unique(np.quantile(arr, np.linspace(0, 1, 11)))
+            vals = pd.to_numeric(df_test[col], errors="coerce").fillna(0.0).to_numpy()
+            qs = np.unique(np.quantile(vals, np.linspace(0, 1, 11)))
             if len(qs) >= 3:
-                df_test[f"{col}_decile"] = np.digitize(arr, qs[1:-1], right=True)
+                df_test[f"{col}_decile"] = np.digitize(vals, qs[1:-1], right=True)
                 segment_defs.append(([f"{col}_decile"], f"{col}_decile"))
 
-    # compute + plots
     for model_name, yp in models.items():
         for cols, tag in segment_defs:
             if any(c not in df_test.columns for c in cols):
@@ -470,41 +491,28 @@ def main():
 
             if len(cols) == 1:
                 x_col = cols[0]
-                if x_col in {"point_id", "city_id", "point_hour"}:
-                    plot_top_bar(
-                        seg, x_col=x_col, y_col="p90_abs_err",
-                        title=f"P90 abs error by {x_col} ({model_name})",
-                        out_path=out_dir / f"p90_top__{model_name}__{x_col}.png",
-                        top_n=20,
-                    )
-                    plot_top_bar(
-                        seg, x_col=x_col, y_col="mae",
-                        title=f"MAE by {x_col} ({model_name})",
-                        out_path=out_dir / f"mae_top__{model_name}__{x_col}.png",
-                        top_n=20,
-                    )
+                if x_col in {"point_id", "city_id"}:
+                    plot_top_bar(seg, x_col, "p90_abs_err",
+                                 f"P90 abs error by {x_col} ({model_name})",
+                                 out_dir / f"p90_top__{model_name}__{x_col}.png", top_n=20)
+                    plot_top_bar(seg, x_col, "mae",
+                                 f"MAE by {x_col} ({model_name})",
+                                 out_dir / f"mae_top__{model_name}__{x_col}.png", top_n=20)
                 elif x_col in {"hour", "weekday"} or x_col.endswith("_decile"):
-                    plot_line_by_bucket(
-                        seg, x_col=x_col, y_col="mae",
-                        title=f"MAE by {x_col} ({model_name})",
-                        out_path=out_dir / f"mae_line__{model_name}__{x_col}.png",
-                    )
-                    plot_line_by_bucket(
-                        seg, x_col=x_col, y_col="p90_abs_err",
-                        title=f"P90 abs err by {x_col} ({model_name})",
-                        out_path=out_dir / f"p90_line__{model_name}__{x_col}.png",
-                    )
+                    plot_line_by_bucket(seg, x_col, "mae",
+                                        f"MAE by {x_col} ({model_name})",
+                                        out_dir / f"mae_line__{model_name}__{x_col}.png")
+                    plot_line_by_bucket(seg, x_col, "p90_abs_err",
+                                        f"P90 abs err by {x_col} ({model_name})",
+                                        out_dir / f"p90_line__{model_name}__{x_col}.png")
                 else:
-                    plot_top_bar(
-                        seg, x_col=x_col, y_col="p90_abs_err",
-                        title=f"P90 abs error by {x_col} ({model_name})",
-                        out_path=out_dir / f"p90_top__{model_name}__{x_col}.png",
-                        top_n=20,
-                    )
+                    plot_top_bar(seg, x_col, "p90_abs_err",
+                                 f"P90 abs error by {x_col} ({model_name})",
+                                 out_dir / f"p90_top__{model_name}__{x_col}.png", top_n=20)
 
         if "items_qty_total_all" in df_test.columns:
             plot_scatter(
-                x=pd.to_numeric(df_test["items_qty_total_all"], errors="coerce").fillna(0).to_numpy(),
+                x=pd.to_numeric(df_test["items_qty_total_all"], errors="coerce").fillna(0.0).to_numpy(),
                 y=np.abs(y_test - yp),
                 title=f"Abs error vs items_qty_total_all ({model_name})",
                 out_path=out_dir / f"scatter_abs_err__{model_name}__items_qty_total_all.png",
@@ -513,7 +521,7 @@ def main():
             )
         if "items_unique_all" in df_test.columns:
             plot_scatter(
-                x=pd.to_numeric(df_test["items_unique_all"], errors="coerce").fillna(0).to_numpy(),
+                x=pd.to_numeric(df_test["items_unique_all"], errors="coerce").fillna(0.0).to_numpy(),
                 y=np.abs(y_test - yp),
                 title=f"Abs error vs items_unique_all ({model_name})",
                 out_path=out_dir / f"scatter_abs_err__{model_name}__items_unique_all.png",
@@ -521,9 +529,16 @@ def main():
                 ylab="abs error (minutes)",
             )
 
+    (out_dir / "diag_run_info.json").write_text(json.dumps({
+        "use_log_target": use_log_target,
+        "cap_minutes": cap_minutes,
+        "blend_weights": {"ridge": w_ridge, "sgd": w_sgd},
+        "split": {"train_frac": args.train_frac, "val_frac": args.val_frac, "min_per_point": args.min_per_point},
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
     print("Done.")
     print(f"Outputs in: {out_dir}")
-    print("Start with: overall_summary.csv and segments__sgd__point.csv / segments__sgd__point_hour_token.csv")
+    print("Start with: overall_summary.csv and segments__sgd__point.csv (sorted by worst P90).")
 
 
 if __name__ == "__main__":

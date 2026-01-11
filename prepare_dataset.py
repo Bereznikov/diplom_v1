@@ -39,6 +39,8 @@ _SIZE_ONLY_RE2 = re.compile(
 # если совсем нет букв (только цифры/символы) — мусор
 _HAS_ANY_LETTERS = re.compile(r"[A-Za-zА-Яа-яЁё]")
 
+BAD_POINTS = {624, 297, 27, 232, 269}
+
 
 def _split_qty(name: str) -> Tuple[str, Optional[int]]:
     name = name.replace("\n", " ").strip()
@@ -302,6 +304,7 @@ def main() -> None:
     total_rows = 0
 
     for df_batch in iter_parquet_batches(cfg.input_dir, columns=columns, batch_size=cfg.batch_size):
+        df_batch = df_batch[~df_batch["point_id"].isin(BAD_POINTS)].copy()
         df_out, X_items = prepare_batch(df_batch, cfg)
         if df_out.empty:
             continue
