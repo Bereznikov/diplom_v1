@@ -202,6 +202,7 @@ def prepare_batch(df: pd.DataFrame, cfg: PrepConfig) -> Tuple[pd.DataFrame, Opti
         if df.empty:
             return df, None
 
+    df = df.reset_index(drop=True)
 
     # time features (используем kitchen_time, иначе created_at)
     dt = df["kitchen_time"].where(~df["kitchen_time"].isna(), df["created_at"])
@@ -222,9 +223,9 @@ def prepare_batch(df: pd.DataFrame, cfg: PrepConfig) -> Tuple[pd.DataFrame, Opti
         unique_all.append(len(d))
         item_dicts.append(d)
 
-    df["items_qty_total_all"] = pd.Series(totals_all, dtype="int32")
-    df["items_lines_all"] = pd.Series(lines_all, dtype="int32")
-    df["items_unique_all"] = pd.Series(unique_all, dtype="int32")
+    df["items_qty_total_all"] = pd.Series(totals_all, index=df.index, dtype="int32")
+    df["items_lines_all"] = pd.Series(lines_all, index=df.index, dtype="int32")
+    df["items_unique_all"] = pd.Series(unique_all, index=df.index, dtype="int32")
 
     X_items = None
     if cfg.hash_items:

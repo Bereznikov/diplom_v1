@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -41,7 +42,7 @@ def pair_parts(base_dir: Path, items_dir: Optional[Path]) -> List[Tuple[Path, Op
     if len(item_files) != len(base_files):
         raise ValueError(f"parts mismatch: parquet={len(base_files)} vs npz={len(item_files)}")
 
-    pairs = []
+    pairs: List[Tuple[Path, Optional[Path]]] = []
     for bf, itf in zip(base_files, item_files):
         if _part_num(bf) != _part_num(itf):
             raise ValueError(f"part id mismatch: {bf.name} vs {itf.name}")
@@ -71,7 +72,7 @@ def load_all_parts(
 
         if items_path is not None:
             X = load_npz(items_path).tocsr()
-            if max_rows is not None and X.shape[0] > len(df):
+            if X.shape[0] != len(df):
                 X = X[: len(df)]
             mats.append(X)
 
@@ -90,17 +91,83 @@ def load_all_parts(
 
 
 # -----------------------------
-# Split (same as training)
+# Derived features (MUST match training)
 # -----------------------------
-def split_by_order_id(df: pd.DataFrame, train_q: float = 0.80, val_q: float = 0.90):
-    oid = df["order_id"].to_numpy()
-    q_train = np.quantile(oid, train_q)
-    q_val = np.quantile(oid, val_q)
+def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Must match train_compare_models.py:
+      - point_hour: "{point_id}__{hour}"
+      - items_qty_total_all_log1p
+      - items_qty_total_all_sq
+      - items_qty_x_unique
+    """
+    # point_hour (category)
+    if "point_id" in df.columns and "hour" in df.columns:
+        pid = pd.to_numeric(df["point_id"], errors="coerce").fillna(-1).astype("int32")
+        hr = pd.to_numeric(df["hour"], errors="coerce").fillna(-1).astype("int16")
+        df["point_hour"] = pid.astype(str) + "__" + hr.astype(str)
 
-    train_idx = np.where(oid <= q_train)[0]
-    val_idx = np.where((oid > q_train) & (oid <= q_val))[0]
-    test_idx = np.where(oid > q_val)[0]
-    return train_idx, val_idx, test_idx
+    # qty nonlinearities
+    if "items_qty_total_all" in df.columns:
+        q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
+        df["items_qty_total_all_log1p"] = np.log1p(q).astype("float32")
+        df["items_qty_total_all_sq"] = (q * q).astype("float32")
+
+    # interaction qty * unique
+    if "items_qty_total_all" in df.columns and "items_unique_all" in df.columns:
+        q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
+        u = pd.to_numeric(df["items_unique_all"], errors="coerce").fillna(0.0).astype("float32")
+        df["items_qty_x_unique"] = (q * u).astype("float32")
+
+    return df
+
+
+# -----------------------------
+# Split (MUST match training: per-point time-aware)
+# -----------------------------
+def split_by_point_order_id(
+    df: pd.DataFrame,
+    train_frac: float = 0.80,
+    val_frac: float = 0.10,
+    min_per_point: int = 50,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if "point_id" not in df.columns:
+        raise ValueError("point_id is required for per-point split")
+
+    train_idx: List[np.ndarray] = []
+    val_idx: List[np.ndarray] = []
+    test_idx: List[np.ndarray] = []
+
+    for pid, g in df.groupby("point_id", sort=False):
+        g_sorted = g.sort_values("order_id")
+        idx = g_sorted.index.to_numpy()
+        n = len(idx)
+
+        if n < min_per_point:
+            train_idx.append(idx)
+            continue
+
+        n_train = int(n * train_frac)
+        n_val = int(n * val_frac)
+
+        n_train = max(n_train, 1)
+        n_val = max(n_val, 1)
+
+        n_test = n - n_train - n_val
+        if n_test < 1:
+            n_val = max(0, n - n_train - 1)
+            n_test = n - n_train - n_val
+
+        train_idx.append(idx[:n_train])
+        if n_val > 0:
+            val_idx.append(idx[n_train:n_train + n_val])
+        test_idx.append(idx[n_train + n_val:])
+
+    train = np.concatenate(train_idx) if train_idx else np.array([], dtype=int)
+    val = np.concatenate(val_idx) if val_idx else np.array([], dtype=int)
+    test = np.concatenate(test_idx) if test_idx else np.array([], dtype=int)
+
+    return train, val, test
 
 
 # -----------------------------
@@ -162,10 +229,6 @@ class SegMetrics:
     tail_45m: float
 
 
-def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(math.sqrt(np.mean((y_true - y_pred) ** 2)))
-
-
 def segment_metrics(
     df: pd.DataFrame,
     y_true: np.ndarray,
@@ -173,10 +236,6 @@ def segment_metrics(
     group_cols: List[str],
     min_count: int = 200,
 ) -> pd.DataFrame:
-    """
-    Efficient-ish segment metrics for limited group cardinality.
-    Computes: count, MAE, RMSE, bias, P50/P90 abs err, tail rates.
-    """
     work = df[group_cols].copy()
     work["_y"] = y_true
     work["_p"] = y_pred
@@ -186,7 +245,6 @@ def segment_metrics(
 
     g = work.groupby(group_cols, dropna=False)
 
-    # fast aggregates
     agg = g.agg(
         count=("_y", "size"),
         mae=("_abs", "mean"),
@@ -197,23 +255,17 @@ def segment_metrics(
     agg["rmse"] = np.sqrt(agg["mse"])
     agg = agg.drop(columns=["mse"])
 
-    # quantiles (more expensive, but ok for point/hour/weekday)
     q = g["_abs"].quantile([0.5, 0.9]).unstack(level=-1).reset_index()
     q = q.rename(columns={0.5: "p50_abs_err", 0.9: "p90_abs_err"})
     agg = agg.merge(q, on=group_cols, how="left")
 
-    # tail rates
-    # (abs_err > 30), (abs_err > 45)
     tail = g["_abs"].apply(lambda s: pd.Series({
         "tail_30m": float((s > 30).mean()),
         "tail_45m": float((s > 45).mean()),
     })).reset_index()
     agg = agg.merge(tail, on=group_cols, how="left")
 
-    # filter small groups
     agg = agg[agg["count"] >= min_count].copy()
-
-    # sort default: worst by p90
     agg = agg.sort_values(["p90_abs_err", "mae"], ascending=False)
 
     return agg
@@ -274,6 +326,7 @@ def main():
     ap.add_argument("--max-rows", type=int, default=None, help="cap rows for faster diagnostics")
     ap.add_argument("--min-count", type=int, default=200, help="min group size for segment tables")
     ap.add_argument("--use-log-target", action="store_true", help="if models trained on log1p(y)")
+    ap.add_argument("--drop-preorders", action="store_true", help="Drop delivery_at_client=1 if column exists")
     args = ap.parse_args()
 
     base_dir = Path(args.base_dir)
@@ -286,8 +339,39 @@ def main():
     pairs = pair_parts(base_dir, items_dir)
     df, X_items = load_all_parts(pairs, max_rows=args.max_rows)
 
-    # split
-    train_idx, val_idx, test_idx = split_by_order_id(df, train_q=0.80, val_q=0.90)
+    # optional: drop preorders (should be 0, but keep as safety)
+    if "delivery_at_client" in df.columns:
+        df["delivery_at_client"] = pd.to_numeric(df["delivery_at_client"], errors="coerce").fillna(0).astype("int8")
+        if args.drop_preorders:
+            keep_mask = (df["delivery_at_client"] == 0).to_numpy()
+            df = df.loc[keep_mask].copy().reset_index(drop=True)
+            if X_items is not None:
+                X_items = X_items[keep_mask]
+
+    # IMPORTANT: add derived features (MUST match training)
+    df = add_derived_features(df)
+
+    # load models + run_info for split params (if exists)
+    run_info_path = model_dir / "run_info.json"
+    split_params = {"train_frac": 0.80, "val_frac": 0.10, "min_per_point": 50}
+    if run_info_path.exists():
+        try:
+            info = json.loads(run_info_path.read_text(encoding="utf-8"))
+            sp = info.get("split", {})
+            split_params["train_frac"] = float(sp.get("train_frac", split_params["train_frac"]))
+            split_params["val_frac"] = float(sp.get("val_frac", split_params["val_frac"]))
+            split_params["min_per_point"] = int(sp.get("min_per_point", split_params["min_per_point"]))
+        except Exception:
+            pass
+
+    # split MUST match training: per-point order_id
+    train_idx, val_idx, test_idx = split_by_point_order_id(
+        df,
+        train_frac=split_params["train_frac"],
+        val_frac=split_params["val_frac"],
+        min_per_point=split_params["min_per_point"],
+    )
+
     df_train = df.iloc[train_idx].copy()
     df_test = df.iloc[test_idx].copy()
 
@@ -297,12 +381,11 @@ def main():
     X_items_train = X_items[train_idx] if X_items is not None else None
     X_items_test = X_items[test_idx] if X_items is not None else None
 
-    # load models
     pre = joblib.load(model_dir / "preprocessor.joblib")
     ridge = joblib.load(model_dir / "ridge.joblib")
     sgd = joblib.load(model_dir / "sgd.joblib")
 
-    # build X
+    # build X (preprocessor expects derived columns to exist!)
     X_train_tab = pre.transform(df_train)
     X_test_tab = pre.transform(df_test)
 
@@ -314,11 +397,9 @@ def main():
             p = np.expm1(p)
         return np.clip(p, 0.0, None)
 
-    # predictions
     pred_ridge = pred_to_minutes(ridge.predict(X_test))
     pred_sgd = pred_to_minutes(sgd.predict(X_test))
 
-    # baseline for reference
     baseline = PointHourMeanBaseline().fit(df_train, y_train)
     pred_ph = baseline.predict(df_test)
 
@@ -338,48 +419,48 @@ def main():
     overall = pd.DataFrame(overall_rows).sort_values("MAE")
     overall.to_csv(out_dir / "overall_summary.csv", index=False)
 
-    # worst individual orders (inspect)
-    # сохраняем по каждой модели
+    # worst orders dump
     for name, yp in models.items():
         abs_err = np.abs(y_test - yp)
-        top_idx = np.argsort(-abs_err)[:200]  # top-200 worst
+        top_idx = np.argsort(-abs_err)[:200]
         worst = df_test.iloc[top_idx].copy()
         worst["y_true"] = y_test[top_idx]
         worst["y_pred"] = yp[top_idx]
         worst["abs_err"] = abs_err[top_idx]
         worst["err"] = (worst["y_true"] - worst["y_pred"])
+
         keep = [c for c in worst.columns if c in [
-            "order_id","point_id","city_id","delivery_method","delivery_at_client",
-            "persons","weekday","hour","is_weekend",
+            "order_id","point_id","city_id","delivery_method",
+            "weekday","hour","is_weekend",
             "items_qty_total_all","items_lines_all","items_unique_all",
-            "y_true","y_pred","abs_err","err"
+            "items_qty_total_all_log1p","items_qty_total_all_sq","items_qty_x_unique",
+            "point_hour",
+            "y_true","y_pred","abs_err","err",
         ]]
         worst[keep].to_csv(out_dir / f"worst_orders__{name}.csv", index=False)
 
-    # segment analyses
+    # segments
     segment_defs = [
         (["point_id"], "point"),
         (["hour"], "hour"),
         (["weekday"], "weekday"),
         (["delivery_method"], "delivery_method"),
-        (["delivery_at_client"], "delivery_at_client"),
-        (["point_id", "hour"], "point_hour"),
+        (["point_id", "hour"], "point_hour_pair"),
+        (["point_hour"], "point_hour_token"),
     ]
 
-    # additionally: buckets by order size
-    # (делаем квантили по items_qty_total_all и items_unique_all)
+    # size buckets on test
     for col in ["items_qty_total_all", "items_unique_all"]:
         if col in df_test.columns:
-            # 10 квантильных корзин, защита от одинаковых границ
-            qs = np.unique(np.quantile(df_test[col].to_numpy(), np.linspace(0, 1, 11)))
+            arr = pd.to_numeric(df_test[col], errors="coerce").fillna(0).to_numpy()
+            qs = np.unique(np.quantile(arr, np.linspace(0, 1, 11)))
             if len(qs) >= 3:
-                df_test[f"{col}_decile"] = np.digitize(df_test[col].to_numpy(), qs[1:-1], right=True)
+                df_test[f"{col}_decile"] = np.digitize(arr, qs[1:-1], right=True)
                 segment_defs.append(([f"{col}_decile"], f"{col}_decile"))
 
-    # compute & save tables + plots
+    # compute + plots
     for model_name, yp in models.items():
         for cols, tag in segment_defs:
-            # skip if some cols missing
             if any(c not in df_test.columns for c in cols):
                 continue
 
@@ -387,11 +468,9 @@ def main():
             seg_path = out_dir / f"segments__{model_name}__{tag}.csv"
             seg.to_csv(seg_path, index=False)
 
-            # plots: for 1-col segments produce top bars / lines
             if len(cols) == 1:
                 x_col = cols[0]
-                # categorical-like: point_id/city -> bar top
-                if x_col in {"point_id", "city_id"}:
+                if x_col in {"point_id", "city_id", "point_hour"}:
                     plot_top_bar(
                         seg, x_col=x_col, y_col="p90_abs_err",
                         title=f"P90 abs error by {x_col} ({model_name})",
@@ -404,7 +483,6 @@ def main():
                         out_path=out_dir / f"mae_top__{model_name}__{x_col}.png",
                         top_n=20,
                     )
-                # ordered small-range: hour / weekday / decile -> line
                 elif x_col in {"hour", "weekday"} or x_col.endswith("_decile"):
                     plot_line_by_bucket(
                         seg, x_col=x_col, y_col="mae",
@@ -417,7 +495,6 @@ def main():
                         out_path=out_dir / f"p90_line__{model_name}__{x_col}.png",
                     )
                 else:
-                    # generic: top bar
                     plot_top_bar(
                         seg, x_col=x_col, y_col="p90_abs_err",
                         title=f"P90 abs error by {x_col} ({model_name})",
@@ -425,10 +502,9 @@ def main():
                         top_n=20,
                     )
 
-        # scatter: abs error vs order size
         if "items_qty_total_all" in df_test.columns:
             plot_scatter(
-                x=df_test["items_qty_total_all"].to_numpy(),
+                x=pd.to_numeric(df_test["items_qty_total_all"], errors="coerce").fillna(0).to_numpy(),
                 y=np.abs(y_test - yp),
                 title=f"Abs error vs items_qty_total_all ({model_name})",
                 out_path=out_dir / f"scatter_abs_err__{model_name}__items_qty_total_all.png",
@@ -437,7 +513,7 @@ def main():
             )
         if "items_unique_all" in df_test.columns:
             plot_scatter(
-                x=df_test["items_unique_all"].to_numpy(),
+                x=pd.to_numeric(df_test["items_unique_all"], errors="coerce").fillna(0).to_numpy(),
                 y=np.abs(y_test - yp),
                 title=f"Abs error vs items_unique_all ({model_name})",
                 out_path=out_dir / f"scatter_abs_err__{model_name}__items_unique_all.png",
@@ -447,7 +523,7 @@ def main():
 
     print("Done.")
     print(f"Outputs in: {out_dir}")
-    print("Start with: overall_summary.csv and segments__sgd__point.csv (sorted by worst P90).")
+    print("Start with: overall_summary.csv and segments__sgd__point.csv / segments__sgd__point_hour_token.csv")
 
 
 if __name__ == "__main__":

@@ -5,18 +5,15 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import timezone, datetime
 from pathlib import Path
-from random import randint
 from typing import Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
-from scipy import sparse
-from scipy.sparse import hstack
-from scipy.sparse import load_npz
 import matplotlib.pyplot as plt
+from scipy import sparse
+from scipy.sparse import hstack, load_npz
 
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -30,11 +27,13 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 _PART_RE = re.compile(r"part-(\d+)\.(parquet|npz)$")
 
+
 def _part_num(p: Path) -> int:
     m = _PART_RE.search(p.name)
     if not m:
         raise ValueError(f"Cannot parse part number from: {p.name}")
     return int(m.group(1))
+
 
 def pair_parts(base_dir: Path, items_dir: Optional[Path]) -> List[Tuple[Path, Optional[Path]]]:
     base_files = sorted(base_dir.glob("part-*.parquet"), key=_part_num)
@@ -48,7 +47,7 @@ def pair_parts(base_dir: Path, items_dir: Optional[Path]) -> List[Tuple[Path, Op
     if len(item_files) != len(base_files):
         raise ValueError(f"parts mismatch: parquet={len(base_files)} vs npz={len(item_files)}")
 
-    pairs = []
+    pairs: List[Tuple[Path, Optional[Path]]] = []
     for bf, itf in zip(base_files, item_files):
         if _part_num(bf) != _part_num(itf):
             raise ValueError(f"part id mismatch: {bf.name} vs {itf.name}")
@@ -57,21 +56,62 @@ def pair_parts(base_dir: Path, items_dir: Optional[Path]) -> List[Tuple[Path, Op
 
 
 # -----------------------------
-# Split: order_id-based (proxy time)
+# Split: per-point time-aware (order_id as proxy time)
 # -----------------------------
 
-def split_by_order_id(df: pd.DataFrame, train_q: float = 0.80, val_q: float = 0.90) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def split_by_point_order_id(
+    df: pd.DataFrame,
+    train_frac: float = 0.80,
+    val_frac: float = 0.10,
+    min_per_point: int = 50,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Splits indices by order_id quantiles. Assumption: order_id roughly increases over time.
-    """
-    oid = df["order_id"].to_numpy()
-    q_train = np.quantile(oid, train_q)
-    q_val = np.quantile(oid, val_q)
+    Гарантирует, что каждая точка (point_id) отдаёт ~train_frac заказов в train (по времени),
+    сортируя внутри точки по order_id (proxy времени).
 
-    train_idx = np.where(oid <= q_train)[0]
-    val_idx = np.where((oid > q_train) & (oid <= q_val))[0]
-    test_idx = np.where(oid > q_val)[0]
-    return train_idx, val_idx, test_idx
+    Если у точки мало заказов (< min_per_point), то все заказы точки отправляются в train
+    (иначе val/test будут статистически невалидными и "шумными").
+    """
+    if "point_id" not in df.columns:
+        raise ValueError("point_id is required for per-point split")
+
+    train_idx: List[np.ndarray] = []
+    val_idx: List[np.ndarray] = []
+    test_idx: List[np.ndarray] = []
+
+    for pid, g in df.groupby("point_id", sort=False):
+        g_sorted = g.sort_values("order_id")
+        idx = g_sorted.index.to_numpy()
+        n = len(idx)
+
+        if n < min_per_point:
+            train_idx.append(idx)
+            continue
+
+        n_train = int(n * train_frac)
+        n_val = int(n * val_frac)
+
+        # защита от пустых частей
+        n_train = max(n_train, 1)
+        n_val = max(n_val, 1)
+
+        # test — остаток
+        n_test = n - n_train - n_val
+        if n_test < 1:
+            # если не хватает на test — уменьшаем val
+            n_val = max(0, n - n_train - 1)
+            n_test = n - n_train - n_val
+
+        train_idx.append(idx[:n_train])
+        if n_val > 0:
+            val_idx.append(idx[n_train:n_train + n_val])
+        test_idx.append(idx[n_train + n_val:])
+
+    train = np.concatenate(train_idx) if train_idx else np.array([], dtype=int)
+    val = np.concatenate(val_idx) if val_idx else np.array([], dtype=int)
+    test = np.concatenate(test_idx) if test_idx else np.array([], dtype=int)
+
+    return train, val, test
 
 
 # -----------------------------
@@ -87,6 +127,7 @@ class Metrics:
     p50_abs_err: float
     p90_abs_err: float
 
+
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Metrics:
     y_true = y_true.astype(float)
     y_pred = y_pred.astype(float)
@@ -95,7 +136,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Metrics:
     rmse = float(math.sqrt(mean_squared_error(y_true, y_pred)))
     r2 = float(r2_score(y_true, y_pred))
 
-    denom = np.maximum(y_true, 1.0)  # чтобы не взрывалось на малых значениях
+    denom = np.maximum(y_true, 1.0)
     mape = float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
 
     abs_err = np.abs(y_true - y_pred)
@@ -104,16 +145,18 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Metrics:
 
     return Metrics(mae=mae, rmse=rmse, r2=r2, mape=mape, p50_abs_err=p50, p90_abs_err=p90)
 
-def plot_model_bars(metrics_df: pd.DataFrame, out_path: Path) -> None:
+
+def plot_model_bars(metrics_df: pd.DataFrame, out_path: Path, metric_col: str = "MAE") -> None:
     plt.figure()
     x = np.arange(len(metrics_df))
-    plt.bar(x, metrics_df["MAE"].to_numpy())
+    plt.bar(x, metrics_df[metric_col].to_numpy())
     plt.xticks(x, metrics_df["model"].tolist(), rotation=25, ha="right")
-    plt.ylabel("MAE (minutes)")
-    plt.title("MAE by model")
+    plt.ylabel(metric_col)
+    plt.title(f"{metric_col} by model")
     plt.tight_layout()
     plt.savefig(out_path, dpi=160)
     plt.close()
+
 
 def plot_pred_vs_true(y_true: np.ndarray, preds: Dict[str, np.ndarray], out_path: Path, sample_n: int = 20000) -> None:
     n = len(y_true)
@@ -125,7 +168,6 @@ def plot_pred_vs_true(y_true: np.ndarray, preds: Dict[str, np.ndarray], out_path
         yt = y_true
         preds_s = preds
 
-    # отдельный график на модель (требование “один график — одна фигура”)
     for name, yp in preds_s.items():
         p = out_path.parent / f"{out_path.stem}__{name}.png"
         plt.figure()
@@ -136,6 +178,7 @@ def plot_pred_vs_true(y_true: np.ndarray, preds: Dict[str, np.ndarray], out_path
         plt.tight_layout()
         plt.savefig(p, dpi=160)
         plt.close()
+
 
 def plot_residual_hist(y_true: np.ndarray, preds: Dict[str, np.ndarray], out_dir: Path) -> None:
     for name, yp in preds.items():
@@ -150,25 +193,19 @@ def plot_residual_hist(y_true: np.ndarray, preds: Dict[str, np.ndarray], out_dir
         plt.savefig(p, dpi=160)
         plt.close()
 
+
 def plot_calibration_deciles(y_true: np.ndarray, preds: Dict[str, np.ndarray], out_dir: Path) -> None:
-    """
-    Разбиваем по децилям предсказания: mean(true) vs mean(pred) по корзинам.
-    """
     for name, yp in preds.items():
-        p = out_dir / f"calibration_deciles__{name}.png"
         yp = yp.astype(float)
         y_true_f = y_true.astype(float)
 
-        # корзины по предикту
         qs = np.quantile(yp, np.linspace(0, 1, 11))
-        # защита от одинаковых квантилей
         qs = np.unique(qs)
         if len(qs) < 3:
             continue
 
         bins = np.digitize(yp, qs[1:-1], right=True)
-        mean_true = []
-        mean_pred = []
+        mean_true, mean_pred = [], []
         for b in range(bins.min(), bins.max() + 1):
             mask = bins == b
             if mask.sum() == 0:
@@ -176,6 +213,7 @@ def plot_calibration_deciles(y_true: np.ndarray, preds: Dict[str, np.ndarray], o
             mean_true.append(y_true_f[mask].mean())
             mean_pred.append(yp[mask].mean())
 
+        p = out_dir / f"calibration_deciles__{name}.png"
         plt.figure()
         plt.plot(mean_pred, mean_true, marker="o")
         plt.xlabel("Mean predicted (bin)")
@@ -212,7 +250,8 @@ def load_all_parts(
 
         if items_path is not None:
             X = load_npz(items_path).tocsr()
-            if max_rows is not None and X.shape[0] > len(df):
+            # подстрахуемся, если вдруг файл/df слегка не совпали по длине
+            if X.shape[0] != len(df):
                 X = X[: len(df)]
             mats.append(X)
 
@@ -236,27 +275,26 @@ def load_all_parts(
 
 def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
     """
+    Предзаказы удалены.
     Табличные признаки:
-      - категориальные: point_id, city_id, delivery_method
-      - числовые: delivery_at_client, persons, weekday, hour, is_weekend, items_* агрегаты
+      - категориальные: point_id, city_id, delivery_method, point_hour(=point_id×hour)
+      - числовые: weekday, hour, is_weekend, items_* агрегаты + нелинейности
     """
-    cat_cols = []
-    for c in ["point_id", "city_id", "delivery_method"]:
-        if c in df.columns:
-            cat_cols.append(c)
+    cat_cols = [c for c in ["point_id", "city_id", "delivery_method", "point_hour"] if c in df.columns]
 
-    num_cols = []
-    for c in [
-        "delivery_at_client", "persons", "weekday", "hour", "is_weekend",
-        "items_qty_total_all", "items_lines_all", "items_unique_all"
-    ]:
-        if c in df.columns:
-            num_cols.append(c)
+    num_cols = [c for c in [
+        "weekday", "hour", "is_weekend",
+        "items_qty_total_all", "items_lines_all", "items_unique_all",
+        "items_qty_total_all_log1p", "items_qty_total_all_sq", "items_qty_x_unique",
+    ] if c in df.columns]
 
-    # OneHotEncoder -> sparse
-    cat_tf = OneHotEncoder(handle_unknown="ignore")
+    # IMPORTANT: чтобы не взрывать OHE на редких point_hour, можно включить min_frequency
+    # (если sklearn >= 1.2). Если нет — оставь как было.
+    try:
+        cat_tf = OneHotEncoder(handle_unknown="ignore", min_frequency=50)
+    except TypeError:
+        cat_tf = OneHotEncoder(handle_unknown="ignore")
 
-    # scaler for numeric; with_mean=False to keep sparse compatibility
     num_tf = StandardScaler(with_mean=False)
 
     return ColumnTransformer(
@@ -267,6 +305,8 @@ def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
         remainder="drop",
         sparse_threshold=1.0,
     )
+
+
 
 def make_X(preprocessor: ColumnTransformer, df: pd.DataFrame, X_items: Optional[sparse.csr_matrix], fit: bool) -> sparse.csr_matrix:
     X_tab = preprocessor.fit_transform(df) if fit else preprocessor.transform(df)
@@ -302,18 +342,15 @@ class PointHourMeanBaseline:
 
     def fit(self, df: pd.DataFrame, y: np.ndarray) -> "PointHourMeanBaseline":
         self.global_mean_ = float(np.mean(y))
-
         if "point_id" not in df.columns:
             return self
 
         tmp = df[["point_id", "weekday", "hour"]].copy()
         tmp["y"] = y
 
-        # point mean
         pm = tmp.groupby("point_id")["y"].mean()
         self.point_mean_ = {int(k): float(v) for k, v in pm.items()}
 
-        # point-hour mean
         ph = tmp.groupby(["point_id", "weekday", "hour"])["y"].mean()
         self.ph_mean_ = {(int(a), int(b), int(c)): float(v) for (a, b, c), v in ph.items()}
         return self
@@ -321,7 +358,6 @@ class PointHourMeanBaseline:
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         out = np.empty(len(df), dtype=float)
         for i, row in enumerate(df.itertuples(index=False)):
-            # getattr for safety
             pid = getattr(row, "point_id", None)
             wd = getattr(row, "weekday", None)
             hr = getattr(row, "hour", None)
@@ -338,6 +374,37 @@ class PointHourMeanBaseline:
         return out
 
 
+def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляем:
+      - point_hour: категориальная фича = "{point_id}__{hour}"
+      - qty_log1p = log1p(items_qty_total_all)
+      - qty_sq = items_qty_total_all^2
+      - qty_x_unique = items_qty_total_all * items_unique_all
+    """
+    # point_hour (категория)
+    if "point_id" in df.columns and "hour" in df.columns:
+        pid = pd.to_numeric(df["point_id"], errors="coerce").fillna(-1).astype("int32")
+        hr = pd.to_numeric(df["hour"], errors="coerce").fillna(-1).astype("int16")
+        df["point_hour"] = pid.astype(str) + "__" + hr.astype(str)
+
+    # qty нелинейности
+    if "items_qty_total_all" in df.columns:
+        q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
+        df["items_qty_total_all_log1p"] = np.log1p(q).astype("float32")
+        df["items_qty_total_all_sq"] = (q * q).astype("float32")
+
+    # взаимодействие qty * unique
+    if "items_qty_total_all" in df.columns and "items_unique_all" in df.columns:
+        q = pd.to_numeric(df["items_qty_total_all"], errors="coerce").fillna(0.0).astype("float32")
+        u = pd.to_numeric(df["items_unique_all"], errors="coerce").fillna(0.0).astype("float32")
+        df["items_qty_x_unique"] = (q * u).astype("float32")
+
+    return df
+
+
+
+
 # -----------------------------
 # Training / evaluation
 # -----------------------------
@@ -349,14 +416,27 @@ def main() -> None:
     ap.add_argument("--out-dir", default="model_out", help="output directory for metrics/plots/models")
     ap.add_argument("--max-rows", type=int, default=None, help="optional cap for quick experiments")
     ap.add_argument("--use-log-target", action="store_true", help="train on log1p(y) and invert for metrics")
-    ap.add_argument("--seed", type=int, default=randint(20, 100000))
+    ap.add_argument("--seed", type=int, default=42)
+
     ap.add_argument("--ridge-alpha", type=float, default=10.0)
+
     ap.add_argument("--sgd-alpha", type=float, default=1e-5)
     ap.add_argument("--sgd-loss", type=str, default="huber", choices=["huber", "squared_error"])
     ap.add_argument("--sgd-epsilon", type=float, default=1.35)
-    args = ap.parse_args()
+    ap.add_argument("--sgd-max-iter", type=int, default=50)
 
-    rng = np.random.RandomState(args.seed)
+    # per-point split params
+    ap.add_argument("--min-per-point", type=int, default=50, help="if point has < N rows -> all go to train")
+    ap.add_argument("--train-frac", type=float, default=0.80)
+    ap.add_argument("--val-frac", type=float, default=0.10)
+
+    # safety (если вдруг предзаказы просочились)
+    ap.add_argument("--drop-preorders", action="store_true", help="Drop delivery_at_client=1 if column exists")
+
+    # optional prediction cap (minutes) to avoid absurd values
+    ap.add_argument("--pred-cap", type=float, default=None, help="Optional cap on predictions in minutes (e.g. 240)")
+
+    args = ap.parse_args()
 
     base_dir = Path(args.base_dir)
     items_dir = Path(args.items_dir) if args.items_dir else None
@@ -366,11 +446,44 @@ def main() -> None:
     pairs = pair_parts(base_dir, items_dir)
     df, X_items = load_all_parts(pairs, max_rows=args.max_rows)
 
+    # optional: drop preorders (страховка)
+    preorder_share = None
+    if "delivery_at_client" in df.columns:
+        df["delivery_at_client"] = pd.to_numeric(df["delivery_at_client"], errors="coerce").fillna(0).astype("int8")
+        preorder_share = float((df["delivery_at_client"] == 1).mean())
+        if args.drop_preorders:
+            df = df[df["delivery_at_client"] == 0].copy()
+            if X_items is not None:
+                # маска по индексу после фильтра
+                # df после фильтра сохранил исходные индексы, поэтому reset:
+                keep_idx = df.index.to_numpy()
+                df = df.reset_index(drop=True)
+                X_items = X_items[keep_idx]
+
+
+    # добавляем кросс-фичи и нелинейности
+    df = add_derived_features(df)
+
+    # на всякий: прибиваем NaN в числовых фичах, чтобы Ridge/SGD не падали
+    for c in [
+        "weekday", "hour", "is_weekend",
+        "items_qty_total_all", "items_lines_all", "items_unique_all",
+        "items_qty_total_all_log1p", "items_qty_total_all_sq", "items_qty_x_unique",
+    ]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+
     # target
     y = df["cooking_minutes"].to_numpy().astype(float)
 
-    # split
-    train_idx, val_idx, test_idx = split_by_order_id(df, train_q=0.80, val_q=0.90)
+    # per-point split
+    train_idx, val_idx, test_idx = split_by_point_order_id(
+        df,
+        train_frac=args.train_frac,
+        val_frac=args.val_frac,
+        min_per_point=args.min_per_point,
+    )
 
     df_train, df_val, df_test = df.iloc[train_idx].copy(), df.iloc[val_idx].copy(), df.iloc[test_idx].copy()
     y_train, y_val, y_test = y[train_idx], y[val_idx], y[test_idx]
@@ -381,24 +494,25 @@ def main() -> None:
 
     # preprocess
     pre = build_preprocessor(df_train)
-
     X_train = make_X(pre, df_train, X_items_train, fit=True)
     X_val = make_X(pre, df_val, X_items_val, fit=False)
     X_test = make_X(pre, df_test, X_items_test, fit=False)
 
-    # optional target transform
+    # target transform
     def y_to_train_space(y_arr: np.ndarray) -> np.ndarray:
         return np.log1p(y_arr) if args.use_log_target else y_arr
 
     def pred_to_minutes(p: np.ndarray) -> np.ndarray:
         if args.use_log_target:
             p = np.expm1(p)
-        # safety clip
-        return np.clip(p, 0.0, None)
+        p = np.clip(p, 0.0, None)
+        if args.pred_cap is not None:
+            p = np.minimum(p, float(args.pred_cap))
+        return p
 
     y_train_t = y_to_train_space(y_train)
 
-    # ------------- Models -------------
+    # ---------------- Models ----------------
     results = []
     preds_test: Dict[str, np.ndarray] = {}
 
@@ -406,25 +520,22 @@ def main() -> None:
     m1 = GlobalMedianBaseline().fit(y_train)
     pred = m1.predict(len(y_test))
     preds_test["baseline_median"] = pred
-    met = compute_metrics(y_test, pred)
-    results.append(("baseline_median", met))
+    results.append(("baseline_median", compute_metrics(y_test, pred)))
 
     # Baseline 2: point-hour mean
     m2 = PointHourMeanBaseline().fit(df_train, y_train)
     pred = m2.predict(df_test)
     preds_test["baseline_point_hour_mean"] = pred
-    met = compute_metrics(y_test, pred)
-    results.append(("baseline_point_hour_mean", met))
+    results.append(("baseline_point_hour_mean", compute_metrics(y_test, pred)))
 
-    # Model 3: Ridge (linear, strong baseline for sparse)
+    # Ridge
     ridge = Ridge(alpha=args.ridge_alpha, solver="sag", random_state=args.seed)
     ridge.fit(X_train, y_train_t)
     pred = pred_to_minutes(ridge.predict(X_test))
     preds_test["ridge"] = pred
-    met = compute_metrics(y_test, pred)
-    results.append(("ridge", met))
+    results.append(("ridge", compute_metrics(y_test, pred)))
 
-    # Model 4: SGDRegressor
+    # SGDRegressor
     sgd = SGDRegressor(
         loss=args.sgd_loss,
         alpha=args.sgd_alpha,
@@ -433,19 +544,16 @@ def main() -> None:
         learning_rate="invscaling",
         eta0=0.01,
         power_t=0.25,
-        max_iter=50,
+        max_iter=args.sgd_max_iter,
         tol=1e-4,
         random_state=args.seed,
     )
-
     sgd.fit(X_train, y_train_t)
     pred = pred_to_minutes(sgd.predict(X_test))
-
     preds_test["sgd"] = pred
-    met = compute_metrics(y_test, pred)
-    results.append(("sgd", met))
+    results.append(("sgd", compute_metrics(y_test, pred)))
 
-    # ------------- Save metrics -------------
+    # ---------------- Metrics table ----------------
     rows = []
     for name, met in results:
         rows.append({
@@ -461,26 +569,45 @@ def main() -> None:
     metrics_path = out_dir / "metrics.csv"
     metrics_df.to_csv(metrics_path, index=False)
 
-    # ------------- Plots -------------
-    plot_model_bars(metrics_df, out_dir / "mae_by_model.png")
+    # ---------------- Plots ----------------
+    plot_model_bars(metrics_df, out_dir / "mae_by_model.png", metric_col="MAE")
+    plot_model_bars(metrics_df, out_dir / "p90_by_model.png", metric_col="P90_abs_err")
     plot_pred_vs_true(y_test, preds_test, out_dir / "pred_vs_true.png", sample_n=20000)
     plot_residual_hist(y_test, preds_test, out_dir)
     plot_calibration_deciles(y_test, preds_test, out_dir)
 
-    # ------------- Save models -------------
+    # ---------------- Save models ----------------
     joblib.dump(pre, out_dir / "preprocessor.joblib")
     joblib.dump(ridge, out_dir / "ridge.joblib")
     joblib.dump(sgd, out_dir / "sgd.joblib")
 
+    # Split stats per point (sanity)
+    points = df["point_id"].nunique() if "point_id" in df.columns else None
+    points_in_test = df_test["point_id"].nunique() if "point_id" in df_test.columns else None
+
     info = {
+        "seed": int(args.seed),
         "use_log_target": bool(args.use_log_target),
+        "drop_preorders_flag": bool(args.drop_preorders),
+        "preorder_share_before_drop": preorder_share,
+        "split": {
+            "type": "per_point_order_id",
+            "train_frac": args.train_frac,
+            "val_frac": args.val_frac,
+            "min_per_point": args.min_per_point,
+            "rows": {"train": int(len(df_train)), "val": int(len(df_val)), "test": int(len(df_test))},
+            "points_total": points,
+            "points_in_test": points_in_test,
+        },
         "ridge_alpha": args.ridge_alpha,
         "sgd": {
             "alpha": args.sgd_alpha,
             "loss": args.sgd_loss,
             "epsilon": args.sgd_epsilon,
+            "max_iter": args.sgd_max_iter,
         },
-        "notes": "X = [OneHot(cats)+Scaled(nums)] + hashed_items_sparse (if provided). Split by order_id quantiles.",
+        "pred_cap": args.pred_cap,
+        "notes": "Preorders assumed removed in prepare_dataset. Split is per-point by order_id (proxy time).",
         "files": {
             "metrics": str(metrics_path),
             "plots_dir": str(out_dir),
@@ -489,6 +616,10 @@ def main() -> None:
     (out_dir / "run_info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(metrics_df.to_string(index=False))
+    print("\nSplit info:")
+    print(json.dumps(info["split"], ensure_ascii=False, indent=2))
+    if preorder_share is not None:
+        print(f"\nPreorders share in loaded data (before optional drop): {preorder_share:.4f}")
     print(f"\nSaved to: {out_dir}")
 
 
