@@ -85,7 +85,7 @@ def _choose_item_key(base: str) -> Optional[str]:
             if key and _HAS_ANY_LETTERS.search(key) and not _SIZE_ONLY_RE.match(key) and not _SIZE_ONLY_RE2.match(key):
                 return key
 
-        # 3) RU: <модификатор>  => берём RU (левую часть), если там есть буквы
+        # 3) RU: <модификатор>  берём RU (левую часть), если там есть буквы
         if left_str and _HAS_ANY_LETTERS.search(left_str):
             key = _normalize_key(left_str)
             if key and not _SIZE_ONLY_RE.match(key) and not _SIZE_ONLY_RE2.match(key):

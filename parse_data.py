@@ -16,75 +16,22 @@ DB_PASSWORD = os.environ["DB_PASSWORD"]
 OUT_DIR = Path("datasets/orders_cooking_v1")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-DATE_FROM = "2025-06-01"  # для проверки поставь пораньше; потом вернёшь нужный период
+DATE_FROM = "2025-06-01"
 
 engine = create_engine(
     f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
     pool_pre_ping=True,
     pool_recycle=3600,
-    echo=True,  # включи, если хочешь видеть SQL в логах
+    echo=True,
 )
 
-QUERY = """
-WITH kitchen_a AS (
-    SELECT
-        a.order_id,
-        a.updated_at AS kitchen_time,
-        a.dump_item AS kitchen_dump_item,
-        ROW_NUMBER() OVER (PARTITION BY a.order_id ORDER BY a.updated_at ASC, a.id ASC) AS rn
-    FROM orders_orderaudit a
-    WHERE a.status = 'kitchen'
-),
-kitchen AS (
-    SELECT
-        order_id,
-        kitchen_time,
-        kitchen_dump_item
-    FROM kitchen_a
-    WHERE rn = 1
-),
-packed_a AS (
-    SELECT
-        a.order_id,
-        a.updated_at AS packed_time,
-        ROW_NUMBER() OVER (PARTITION BY a.order_id ORDER BY a.updated_at ASC, a.id ASC) AS rn
-    FROM orders_orderaudit a
-    JOIN kitchen k ON k.order_id = a.order_id
-    WHERE a.status = 'packed'
-      AND a.updated_at > k.kitchen_time
-),
-packed AS (
-    SELECT
-        order_id,
-        packed_time
-    FROM packed_a
-    WHERE rn = 1
-)
-SELECT
-    o.id AS order_id,
-    o.point_id,
-    o.city_id,
-    o.delivery_method,
-    o.delivery_at_client,
-    o.created_at,
-    o.persons,
-    k.kitchen_time,
-    p.packed_time,
-    TIMESTAMPDIFF(MINUTE, k.kitchen_time, p.packed_time) AS cooking_minutes,
-    k.kitchen_dump_item AS dump_item
-FROM orders_order o
-JOIN kitchen k ON k.order_id = o.id
-JOIN packed  p ON p.order_id = o.id
-WHERE o.created_at >= :date_from
-  AND p.packed_time > k.kitchen_time;
-"""
+QUERY = os.environ["QUERY"]
 
 def main():
     chunksize = 200_000
     part = 0
 
     with engine.connect() as conn:
-        # Быстрые sanity checks (по желанию)
         db = pd.read_sql(text("SELECT DATABASE() AS db"), conn)
         print(db.to_string(index=False))
 
@@ -109,9 +56,9 @@ def main():
             # Базовая чистка
             chunk = chunk.dropna(subset=["kitchen_time", "packed_time", "cooking_minutes"])
 
-            # Фильтры по здравому смыслу (временно можно ослабить для дебага)
+            # Фильтры по здравому смыслу
             chunk = chunk[chunk["cooking_minutes"] > 0]
-            chunk = chunk[chunk["cooking_minutes"] < 240]  # 4 часа; подстрой под бизнес
+            chunk = chunk[chunk["cooking_minutes"] < 240]
 
             if chunk.empty:
                 print("all rows filtered out -> skip")

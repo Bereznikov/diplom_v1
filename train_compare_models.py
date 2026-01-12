@@ -314,7 +314,6 @@ def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
         "items_qty_total_all_log1p", "items_qty_total_all_sq", "items_qty_x_unique",
     ] if c in df.columns]
 
-    # если sklearn>=1.2: min_frequency помогает не взрывать редкие point_hour
     try:
         cat_tf = OneHotEncoder(handle_unknown="ignore", min_frequency=50)
     except TypeError:
@@ -424,10 +423,6 @@ def best_blend_weight(
     metric: str = "p90",
     grid: Optional[np.ndarray] = None,
 ) -> Tuple[float, Metrics]:
-    """
-    Finds w in [0..1] to minimize metric on y_val for:
-        pred = w*pred_model + (1-w)*pred_base
-    """
     if grid is None:
         grid = np.linspace(0.0, 1.0, 21)
 
