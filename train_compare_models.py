@@ -472,7 +472,7 @@ def main() -> None:
     # cap predictions
     ap.add_argument("--no-cap", action="store_true", help="Disable prediction capping")
     ap.add_argument("--pred-cap", type=float, default=None, help="Hard cap on predictions in minutes (e.g. 240)")
-    ap.add_argument("--pred-cap-quantile", type=float, default=0.995,
+    ap.add_argument("--pred-cap-quantile", type=float, default=0.999,
                     help="If pred-cap not set: cap = quantile(y_train, q). Set --no-cap to disable.")
 
     # models

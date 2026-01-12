@@ -1,0 +1,83 @@
+{
+  "seed": 47,
+  "use_log_target": true,
+  "preorders": {
+    "drop_preorders_flag": false,
+    "preorder_share_before_drop": 0.0
+  },
+  "excluded_points": [
+    624
+  ],
+  "split": {
+    "type": "per_point_order_id",
+    "train_frac": 0.8,
+    "val_frac": 0.1,
+    "min_per_point": 50,
+    "rows": {
+      "train": 1202510,
+      "val": 150255,
+      "test": 150443
+    },
+    "points_total": 160,
+    "points_in_test": 157
+  },
+  "pred_cap": {
+    "enabled": true,
+    "mode": "quantile",
+    "minutes": 149.0,
+    "quantile": 0.999
+  },
+  "ridge": {
+    "alpha": 10.0
+  },
+  "sgd": {
+    "alpha": 1e-05,
+    "loss": "huber",
+    "epsilon": 1.35,
+    "max_iter": 50
+  },
+  "blend": {
+    "enabled": true,
+    "metric": "p90",
+    "grid": {
+      "n": 21,
+      "from": 0.0,
+      "to": 1.0
+    },
+    "weights": {
+      "ridge": {
+        "w_model": 0.8500000000000001,
+        "val_metrics": {
+          "mae": 8.08439486935151,
+          "rmse": 12.658490315912838,
+          "r2": 0.26724826591488293,
+          "mape": 42.59668275112037,
+          "p50_abs_err": 5.788200052643948,
+          "p90_abs_err": 16.15334074251683
+        }
+      },
+      "sgd": {
+        "w_model": 0.8500000000000001,
+        "val_metrics": {
+          "mae": 8.066740821518158,
+          "rmse": 12.722765786985427,
+          "r2": 0.2597880498293932,
+          "mape": 42.10149528897495,
+          "p50_abs_err": 5.731462846232336,
+          "p90_abs_err": 16.09826654653771
+        }
+      }
+    }
+  },
+  "files": {
+    "metrics": "model_out_v3/metrics.csv",
+    "plots_dir": "model_out_v3",
+    "models": {
+      "preprocessor": "preprocessor.joblib",
+      "ridge": "ridge.joblib",
+      "sgd": "sgd.joblib",
+      "baseline_point_hour_mean": "baseline_point_hour_mean.joblib"
+    }
+  },
+  "notes": "X = [OHE(cats)+Scaled(nums)] + hashed_items_sparse (if provided). Split is per-point by order_id."
+}
